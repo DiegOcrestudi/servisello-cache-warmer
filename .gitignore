@@ -1,0 +1,14 @@
+.DS_Store
+*.log
+*.sql
+*.zip
+*.tar
+*.gz
+
+vendor/
+node_modules/
+
+.env
+.env.*
+
+.idea/
