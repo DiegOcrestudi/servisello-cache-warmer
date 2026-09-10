@@ -2,8 +2,8 @@
 /**
  * Plugin Name:       Servisello Cache Warmer
  * Plugin URI:        https://www.servisello.es/
- * Description:       Crawler conservador de calentamiento y validación de caché para Servisello.es. Fase F2.1: base de F1 más la cola persistente. No realiza todavía ninguna petición de calentamiento.
- * Version:           1.1.0-f2.1
+ * Description:       Crawler conservador de calentamiento y validación de caché para Servisello.es. Fase F2.2: base de F1, cola persistente y normalizador de URLs. No realiza todavía ninguna petición de calentamiento.
+ * Version:           1.2.0-f2.2
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            Servisello
@@ -16,7 +16,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'SCW_VERSION', '1.1.0-f2.1' );
+define( 'SCW_VERSION', '1.2.0-f2.2' );
 define( 'SCW_PLUGIN_FILE', __FILE__ );
 define( 'SCW_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'SCW_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -35,6 +35,7 @@ require_once SCW_PLUGIN_DIR . 'includes/class-scw-settings.php';
 require_once SCW_PLUGIN_DIR . 'includes/class-scw-state.php';
 require_once SCW_PLUGIN_DIR . 'includes/class-scw-logger.php';
 require_once SCW_PLUGIN_DIR . 'includes/crawler/class-scw-queue.php';
+require_once SCW_PLUGIN_DIR . 'includes/crawler/class-scw-url-normalizer.php';
 require_once SCW_PLUGIN_DIR . 'includes/runner/class-scw-scheduler.php';
 require_once SCW_PLUGIN_DIR . 'includes/admin/class-scw-admin.php';
 require_once SCW_PLUGIN_DIR . 'includes/class-scw-activator.php';
