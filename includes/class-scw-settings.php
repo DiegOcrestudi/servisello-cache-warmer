@@ -59,7 +59,7 @@ class SCW_Settings {
 				'msclkid',
 				'_gl',
 			),
-			'allowed_params'           => array(), // Vacío: sólo se conserva lo listado aquí.
+			'allowed_params'           => array(), // Lista de rescate: lo aquí listado se conserva aunque encaje en ignored_params. No es una lista blanca: los parámetros desconocidos se conservan igualmente.
 
 			// --- Exclusiones -------------------------------------------------
 			'exclude_exact'            => array(),
