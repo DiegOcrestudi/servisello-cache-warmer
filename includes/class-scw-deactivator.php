@@ -35,27 +35,12 @@ class SCW_Deactivator {
 	/**
 	 * Devuelve a pending cualquier elemento que se quedara en processing.
 	 *
-	 * En F1 la cola siempre está vacía, pero el método ya existe para que la
-	 * desactivación sea segura en cuanto F2 empiece a encolar.
+	 * Desde F2.1 la sentencia vive en SCW_Queue, que es la propietaria de la
+	 * tabla. El comportamiento observable es idéntico al de F1.
 	 *
 	 * @return int Filas afectadas.
 	 */
 	private static function release_leases() {
-		global $wpdb;
-
-		if ( ! SCW_Schema::table_exists( 'queue' ) ) {
-			return 0;
-		}
-
-		$table = SCW_Schema::table( 'queue' );
-
-		return (int) $wpdb->query( // phpcs:ignore WordPress.DB
-			$wpdb->prepare(
-				"UPDATE {$table}
-				 SET status = 'pending', lease_owner = NULL, lease_expires_at = NULL, updated_at = %s
-				 WHERE status = 'processing'",
-				current_time( 'mysql', true )
-			)
-		);
+		return SCW_Queue::release_all_locks();
 	}
 }
