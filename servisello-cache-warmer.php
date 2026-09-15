@@ -2,8 +2,8 @@
 /**
  * Plugin Name:       Servisello Cache Warmer
  * Plugin URI:        https://www.servisello.es/
- * Description:       Crawler conservador de calentamiento y validación de caché para Servisello.es. Fase F2.4: base de F1, cola persistente, normalizador de URLs, motor de exclusiones y pipeline de encolado desde sitemap. No realiza todavía ninguna petición de calentamiento.
- * Version:           1.4.0-f2.4
+ * Description:       Crawler conservador de calentamiento y validación de caché para Servisello.es. Fase F3: cliente HTTP, worker de una URL por tick, cola/leases reales (SCW_Queue ya existente), registro en scw_runs y ejecución real del scheduler con lock global. Todavía no valida contenido HTML ni YITH (F4) ni aplica pacing/circuit breaker (F5).
+ * Version:           1.5.0-f3
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            Servisello
@@ -16,7 +16,7 @@
 
 defined( 'ABSPATH' ) || exit;
 
-define( 'SCW_VERSION', '1.4.0-f2.4' );
+define( 'SCW_VERSION', '1.5.0-f3' );
 define( 'SCW_PLUGIN_FILE', __FILE__ );
 define( 'SCW_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'SCW_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -35,11 +35,14 @@ require_once SCW_PLUGIN_DIR . 'includes/class-scw-settings.php';
 require_once SCW_PLUGIN_DIR . 'includes/class-scw-state.php';
 require_once SCW_PLUGIN_DIR . 'includes/class-scw-logger.php';
 require_once SCW_PLUGIN_DIR . 'includes/crawler/class-scw-queue.php';
+require_once SCW_PLUGIN_DIR . 'includes/crawler/class-scw-runs.php';
 require_once SCW_PLUGIN_DIR . 'includes/crawler/class-scw-url-normalizer.php';
 require_once SCW_PLUGIN_DIR . 'includes/crawler/class-scw-url-exclusions.php';
 require_once SCW_PLUGIN_DIR . 'includes/crawler/class-scw-sitemap-parser.php';
 require_once SCW_PLUGIN_DIR . 'includes/crawler/class-scw-sitemap-sources.php';
 require_once SCW_PLUGIN_DIR . 'includes/crawler/class-scw-sitemap-pipeline.php';
+require_once SCW_PLUGIN_DIR . 'includes/http/class-scw-http-client.php';
+require_once SCW_PLUGIN_DIR . 'includes/runner/class-scw-worker.php';
 require_once SCW_PLUGIN_DIR . 'includes/runner/class-scw-scheduler.php';
 require_once SCW_PLUGIN_DIR . 'includes/admin/class-scw-admin.php';
 require_once SCW_PLUGIN_DIR . 'includes/class-scw-activator.php';

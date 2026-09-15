@@ -2,15 +2,18 @@
 /**
  * Planificador.
  *
- * En F1 el scheduler está completamente cableado pero es INERTE:
+ * Desde F3, scw_tick deja de ser inerte:
  *
- *  - scw_tick    : registrado, nunca programado y, si alguien lo dispara a mano,
- *                  sale inmediatamente porque run_status es STOPPED. No hace
- *                  ninguna petición HTTP.
- *  - scw_watchdog: recurrente cada 5 minutos. Sólo escribe un latido en el
- *                  estado (para poder demostrar que WP-Cron nativo se dispara)
- *                  y ejecuta la limpieza por retención una vez al día. No
- *                  calienta nada.
+ *  - scw_tick    : si el crawler está RUNNING, adquiere el lock global
+ *                  (LOCK_TRANSIENT) para impedir ejecuciones simultáneas,
+ *                  ejecuta un único SCW_Worker::run_once() (como máximo una
+ *                  URL, como máximo una petición HTTP) y, si sigue RUNNING,
+ *                  programa el siguiente scw_tick con wp_schedule_single_event()
+ *                  encadenado. No hay cron recurrente para el warmer.
+ *  - scw_watchdog: sin cambios respecto a F1/F2. Recurrente cada 5 minutos,
+ *                  sólo escribe un latido y ejecuta la limpieza por retención
+ *                  una vez al día. La detección de stall del planificador
+ *                  sigue siendo una preocupación de F5.
  *
  * El filtro cron_schedules se registra al cargar el fichero del plugin, no en
  * plugins_loaded, porque en el momento del hook de activación plugins_loaded ya
@@ -27,6 +30,28 @@ class SCW_Scheduler {
 	const HOOK_WATCHDOG  = 'scw_watchdog';
 	const SCHEDULE_SLUG  = 'scw_five_minutes';
 	const LOCK_TRANSIENT = 'scw_tick_lock';
+
+	/**
+	 * Duración del lock global del tick, en segundos.
+	 *
+	 * No es un ajuste de pacing (eso es F5): es sólo el margen de seguridad
+	 * del lock de exclusión mutua entre ejecuciones de scw_tick. Se fija a un
+	 * valor generoso pero acotado, muy por encima del http_timeout por
+	 * defecto (30 s) más margen para la escritura en BD, de modo que un
+	 * proceso colgado o un fatal no dejen el scheduler bloqueado para
+	 * siempre: el lock expira solo.
+	 */
+	const TICK_LOCK_SECONDS = 90;
+
+	/**
+	 * Retardo por defecto entre un tick y el siguiente cuando no hay ningún
+	 * ajuste de pacing más específico que usar.
+	 *
+	 * F3 reutiliza el valor ya existente de pace_base_delay como intervalo
+	 * FIJO entre ticks, sin ninguna lógica adaptativa: eso es F5. Si el
+	 * ajuste no existe o es inválido, se usa este valor de reserva.
+	 */
+	const DEFAULT_TICK_DELAY_SECONDS = 5;
 
 	/**
 	 * Registra los hooks. Se llama desde SCW_Plugin::run().
@@ -99,10 +124,12 @@ class SCW_Scheduler {
 	/**
 	 * Tick del worker.
 	 *
-	 * F1: no existe worker todavía. Si el estado no es RUNNING se sale sin hacer
-	 * nada. Si alguien fuerza el hook estando en RUNNING (imposible en F1, porque
-	 * no hay forma de ponerlo en RUNNING desde la interfaz), se registra y se
-	 * sale igualmente. Nunca se realiza una petición HTTP en esta fase.
+	 * Si el estado no es RUNNING, sale sin hacer nada (igual que en F1/F2). Si
+	 * está RUNNING, intenta adquirir el lock global del tick; si ya hay otra
+	 * ejecución en curso, sale sin procesar. Con el lock adquirido, ejecuta un
+	 * único SCW_Worker::run_once() y, si el crawler sigue RUNNING, programa el
+	 * siguiente scw_tick. El lock se libera siempre, incluso si el worker
+	 * lanza una excepción.
 	 *
 	 * @return void
 	 */
@@ -117,20 +144,134 @@ class SCW_Scheduler {
 			return;
 		}
 
-		SCW_Logger::warning(
-			SCW_Logger::CODE_TICK_IDLE,
-			'Tick recibido pero el worker todavía no está implementado (fase F1).'
-		);
+		if ( ! self::acquire_tick_lock() ) {
+			SCW_Logger::log(
+				SCW_Logger::CODE_TICK_SKIPPED,
+				'Tick descartado: ya hay otra ejecución de scw_tick en curso.',
+				array( 'reason' => 'tick_lock_busy' ),
+				SCW_Logger::LEVEL_DEBUG
+			);
+			return;
+		}
 
-		SCW_State::set( array( 'last_tick_at' => time() ) );
+		try {
+			$result = SCW_Worker::run_once();
+
+			SCW_State::set( array( 'last_tick_at' => time() ) );
+
+			if ( SCW_Worker::RESULT_EMPTY === $result['result'] ) {
+				SCW_Logger::info( SCW_Logger::CODE_QUEUE_EMPTY, 'La cola no tiene URLs pendientes en este tick.' );
+			} else {
+				SCW_Logger::info(
+					SCW_Logger::CODE_TICK_OK,
+					'Tick ejecutado.',
+					array(
+						'queue_id'     => $result['queue_id'],
+						'queue_status' => $result['queue_status'],
+						'http_status'  => $result['http_status'],
+						'error_type'   => $result['error_type'],
+					)
+				);
+			}
+
+			if ( SCW_State::is_running() ) {
+				self::schedule_next_tick();
+			}
+		} finally {
+			self::release_tick_lock();
+		}
+	}
+
+	/**
+	 * Intenta adquirir el lock global del tick.
+	 *
+	 * Reutiliza el transient ya reservado por F1 (LOCK_TRANSIENT), sin crear
+	 * ningún mecanismo paralelo. Es una exclusión "best effort" al estilo de
+	 * la que usa el propio wp-cron.php de WordPress core para evitar
+	 * disparos solapados (comprobar y luego fijar el transient), no un lock
+	 * atómico garantizado a nivel de fila como el de SCW_Queue::claim(). Ante
+	 * una carrera muy estrecha entre dos peticiones casi simultáneas, el peor
+	 * caso posible es que dos ticks reclamen y procesen dos filas DISTINTAS
+	 * de la cola en paralelo; nunca la misma fila dos veces, porque para eso
+	 * sigue existiendo la protección atómica de SCW_Queue.
+	 *
+	 * @return bool True si se ha adquirido el lock.
+	 */
+	private static function acquire_tick_lock() {
+		if ( false !== get_transient( self::LOCK_TRANSIENT ) ) {
+			return false;
+		}
+
+		set_transient( self::LOCK_TRANSIENT, time(), self::TICK_LOCK_SECONDS );
+
+		return true;
+	}
+
+	/**
+	 * Libera el lock global del tick.
+	 *
+	 * @return void
+	 */
+	private static function release_tick_lock() {
+		delete_transient( self::LOCK_TRANSIENT );
+	}
+
+	/**
+	 * Programa el siguiente scw_tick si no hay ya uno pendiente.
+	 *
+	 * Modelo de cadena (wp_schedule_single_event encadenado), sin cron
+	 * recurrente para el warmer. El retardo reutiliza de forma mínima el
+	 * ajuste existente pace_base_delay como intervalo FIJO: no hay ninguna
+	 * lógica adaptativa aquí, eso es F5.
+	 *
+	 * @param int|null $delay_seconds Retardo explícito en segundos. Null usa
+	 *                                el ajuste pace_base_delay.
+	 * @return bool True si queda un tick programado (ya existente o recién creado).
+	 */
+	public static function schedule_next_tick( $delay_seconds = null ) {
+		if ( wp_next_scheduled( self::HOOK_TICK ) ) {
+			return true;
+		}
+
+		$delay = null === $delay_seconds ? self::next_tick_delay() : max( 0, (int) $delay_seconds );
+
+		$scheduled = wp_schedule_single_event( time() + $delay, self::HOOK_TICK, array(), true );
+
+		if ( false === $scheduled || is_wp_error( $scheduled ) ) {
+			SCW_Logger::error(
+				SCW_Logger::CODE_CRON_NOT_SCHEDULED,
+				'No se ha podido programar el siguiente scw_tick.',
+				array(
+					'delay' => $delay,
+					'error' => is_wp_error( $scheduled ) ? $scheduled->get_error_message() : null,
+				)
+			);
+			return false;
+		}
+
+		return true;
+	}
+
+	/**
+	 * Retardo fijo entre ticks, en segundos.
+	 *
+	 * @return int
+	 */
+	private static function next_tick_delay() {
+		$delay = (int) SCW_Settings::get( 'pace_base_delay', self::DEFAULT_TICK_DELAY_SECONDS );
+
+		return $delay < 1 ? self::DEFAULT_TICK_DELAY_SECONDS : $delay;
 	}
 
 	/**
 	 * Watchdog.
 	 *
-	 * F1: latido y limpieza por retención. La detección de stall del planificador
-	 * y la recuperación de leases caducados se activan en F3/F5, cuando existan
-	 * ticks reales que vigilar.
+	 * Sin cambios funcionales respecto a F1/F2: late y limpia por retención.
+	 * Desde F3, SCW_Worker recupera los leases caducados en cada tick (vía
+	 * SCW_Queue::release_expired_locks()), así que ese caso ya no depende del
+	 * watchdog. La detección de stall del planificador (ticks que deberían
+	 * estar llegando y han dejado de hacerlo) sigue siendo una preocupación
+	 * de F5.
 	 *
 	 * @return void
 	 */
