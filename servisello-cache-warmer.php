@@ -42,6 +42,7 @@ require_once SCW_PLUGIN_DIR . 'includes/crawler/class-scw-sitemap-parser.php';
 require_once SCW_PLUGIN_DIR . 'includes/crawler/class-scw-sitemap-sources.php';
 require_once SCW_PLUGIN_DIR . 'includes/crawler/class-scw-sitemap-pipeline.php';
 require_once SCW_PLUGIN_DIR . 'includes/http/class-scw-http-client.php';
+require_once SCW_PLUGIN_DIR . 'includes/validation/class-scw-html-validator.php';
 require_once SCW_PLUGIN_DIR . 'includes/runner/class-scw-worker.php';
 require_once SCW_PLUGIN_DIR . 'includes/runner/class-scw-scheduler.php';
 require_once SCW_PLUGIN_DIR . 'includes/admin/class-scw-admin.php';
