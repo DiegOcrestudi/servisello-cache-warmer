@@ -104,9 +104,15 @@ class SCW_Runs {
 			'user_agent'                => self::nullable_string( isset( $data['user_agent'] ) ? $data['user_agent'] : null, 255 ),
 			'error_type'                => self::nullable_string( isset( $data['error_type'] ) ? $data['error_type'] : null, 32 ),
 			'error_message'             => $error_message,
-			// Reservado para F4. Nunca se rellena aquí.
-			'validation_result'         => null,
-			'yith_presets'              => null,
+			// F4.4: veredicto de la validación de contenido. Lo calcula
+			// SCW_Content_Validator y lo pasa el Worker; esta clase sólo lo
+			// acota al ancho de la columna. Valores: ok|suspicious|error, o
+			// NULL si no hubo validación de contenido.
+			'validation_result'         => self::nullable_string( isset( $data['validation_result'] ) ? $data['validation_result'] : null, 32 ),
+			// Presets YITH válidos detectados, separados por coma (p. ej.
+			// "6432,6683"). NULL si no se validó contenido o no se detectó
+			// ninguno. Los presets desconocidos NO van aquí: van a diagnostics.
+			'yith_presets'              => self::nullable_string( isset( $data['yith_presets'] ) ? $data['yith_presets'] : null, 191 ),
 			'diagnostics'               => $diagnostics,
 		);
 

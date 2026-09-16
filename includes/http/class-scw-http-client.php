@@ -78,6 +78,11 @@ class SCW_HTTP_Client {
 	 *     @type int         $http_status               Código HTTP, 0 si no hubo respuesta.
 	 *     @type int         $duration_ms               Duración de la petición.
 	 *     @type int         $bytes                     Bytes reales del body recibido.
+	 *     @type string      $body                      Cuerpo de la respuesta, cadena vacía si no la hubo.
+	 *                                                  Se devuelve para que la validación de contenido (F4)
+	 *                                                  pueda analizarlo en el mismo ciclo. NUNCA se persiste
+	 *                                                  en base de datos: quien lo reciba debe consumirlo y
+	 *                                                  soltarlo. El límite de MAX_BODY_BYTES sigue vigente.
 	 *     @type string|null $content_type
 	 *     @type string|null $x_litespeed_cache
 	 *     @type string|null $x_litespeed_cache_control
@@ -99,6 +104,7 @@ class SCW_HTTP_Client {
 			'http_status'               => 0,
 			'duration_ms'               => 0,
 			'bytes'                     => 0,
+			'body'                      => '',
 			'content_type'              => null,
 			'x_litespeed_cache'         => null,
 			'x_litespeed_cache_control' => null,
@@ -148,6 +154,7 @@ class SCW_HTTP_Client {
 		$base['ok']          = true;
 		$base['http_status'] = $code;
 		$base['bytes']       = strlen( (string) $body );
+		$base['body']        = (string) $body;
 
 		$base['content_type']              = self::header( $response, 'content-type' );
 		$base['x_litespeed_cache']         = self::header( $response, 'x-litespeed-cache' );

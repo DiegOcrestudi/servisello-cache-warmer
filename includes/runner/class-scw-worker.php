@@ -5,13 +5,18 @@
  * Orquesta un único ciclo: recupera leases caducados, reclama como máximo UNA
  * URL de la cola, la valida, ejecuta como máximo UNA petición HTTP, registra
  * el resultado en scw_runs y completa la fila de la cola usando su
- * lock_token. No implementa reintentos, pacing ni circuit breaker (F5) y no
- * valida el contenido HTML ni YITH (F4).
+ * lock_token. No implementa reintentos, pacing ni circuit breaker (F5).
  *
  * Reutiliza siempre las abstracciones existentes: SCW_Queue para el ciclo de
  * vida de la cola, SCW_URL_Normalizer y SCW_URL_Exclusions para decidir si
- * una URL debe pedirse, SCW_HTTP_Client para la petición y SCW_Runs para el
- * registro. Esta clase no vuelve a implementar nada de eso.
+ * una URL debe pedirse, SCW_HTTP_Client para la petición, SCW_Content_Validator
+ * para el veredicto de integridad y SCW_Runs para el registro. Esta clase no
+ * vuelve a implementar nada de eso.
+ *
+ * F4.4: la validación de contenido se inserta entre la petición y el registro.
+ * Las REGLAS de esa decisión no viven aquí: el Worker sólo pasa la respuesta a
+ * SCW_Content_Validator y traduce su veredicto al estado terminal de la cola.
+ * Si hay que cambiar qué se considera dudoso, se cambia allí, no aquí.
  *
  * @package Servisello_Cache_Warmer
  */
@@ -20,10 +25,11 @@ defined( 'ABSPATH' ) || exit;
 
 class SCW_Worker {
 
-	const RESULT_EMPTY   = 'empty';
-	const RESULT_SKIPPED = 'skipped';
-	const RESULT_SUCCESS = 'success';
-	const RESULT_FAILED  = 'failed';
+	const RESULT_EMPTY      = 'empty';
+	const RESULT_SKIPPED    = 'skipped';
+	const RESULT_SUCCESS    = 'success';
+	const RESULT_SUSPICIOUS = 'suspicious';
+	const RESULT_FAILED     = 'failed';
 
 	/**
 	 * Ejecuta un único ciclo de calentamiento.
@@ -34,12 +40,13 @@ class SCW_Worker {
 	 * fila en scw_runs: sólo se completa la cola.
 	 *
 	 * @return array {
-	 *     @type string      $result           empty|skipped|success|failed.
+	 *     @type string      $result            empty|skipped|success|suspicious|failed.
 	 *     @type int|null    $queue_id
-	 *     @type string|null $queue_status     Estado terminal aplicado a la cola.
+	 *     @type string|null $queue_status      Estado terminal aplicado a la cola.
 	 *     @type int|null    $http_status
 	 *     @type string|null $error_type
-	 *     @type int         $recovered_leases Filas recuperadas de leases caducados en este ciclo.
+	 *     @type string|null $validation_result Veredicto de contenido, o null si no lo hubo.
+	 *     @type int         $recovered_leases  Filas recuperadas de leases caducados en este ciclo.
 	 * }
 	 */
 	public static function run_once() {
@@ -57,12 +64,13 @@ class SCW_Worker {
 		);
 
 		$outcome = array(
-			'result'           => self::RESULT_EMPTY,
-			'queue_id'         => null,
-			'queue_status'     => null,
-			'http_status'      => null,
-			'error_type'       => null,
-			'recovered_leases' => 0,
+			'result'            => self::RESULT_EMPTY,
+			'queue_id'          => null,
+			'queue_status'      => null,
+			'http_status'       => null,
+			'error_type'        => null,
+			'validation_result' => null,
+			'recovered_leases'  => 0,
 		);
 
 		$outcome['recovered_leases'] = self::recover_expired_leases();
@@ -109,7 +117,14 @@ class SCW_Worker {
 
 		$http = SCW_HTTP_Client::fetch( $claimed['url'] );
 
-		// 3. Registro del run. Toda petición HTTP real (2xx-5xx, timeout o
+		// 3. Validación de contenido (F4.4). Es el único punto donde el body
+		// está disponible; se consume aquí y se suelta al terminar el ciclo.
+		// Nunca se persiste.
+		$verdict = SCW_Content_Validator::validate( $http, $claimed['url'] );
+
+		unset( $http['body'] );
+
+		// 4. Registro del run. Toda petición HTTP real (2xx-5xx, timeout o
 		// error de transporte) genera exactamente una fila.
 		SCW_Runs::insert(
 			array(
@@ -128,30 +143,32 @@ class SCW_Worker {
 				'user_agent'                => $http['user_agent'],
 				'error_type'                => $http['error_type'],
 				'error_message'             => $http['error_message'],
-				'diagnostics'               => self::build_diagnostics( $http ),
+				'validation_result'         => $verdict['result'],
+				'yith_presets'              => $verdict['yith_presets'],
+				'diagnostics'               => self::build_diagnostics( $http, $verdict ),
 			)
 		);
 
-		// 4. Cierre de la cola. Un error HTTP es un resultado de la petición,
-		// no un fallo del sistema: nunca genera un scw_event, sólo el estado
-		// de la cola y la fila de scw_runs ya creada.
-		$queue_status = self::status_for_http_result( $http );
-		$last_result  = self::last_result_for_http_result( $http );
+		// 5. Cierre de la cola. Un error HTTP o un HTML dudoso son resultados
+		// de la petición, no fallos del sistema: nunca generan un scw_event,
+		// sólo el estado de la cola y la fila de scw_runs ya creada.
+		$queue_status = $verdict['queue_status'];
 
 		SCW_Queue::complete(
 			$claimed['id'],
 			$queue_status,
 			array(
 				'lock_token'  => $claimed['lock_token'],
-				'last_result' => $last_result,
+				'last_result' => $verdict['last_result'],
 				'last_error'  => $http['error_message'],
 			)
 		);
 
-		$outcome['result']       = ( SCW_Queue::STATUS_SUCCESS === $queue_status ) ? self::RESULT_SUCCESS : self::RESULT_FAILED;
-		$outcome['queue_status'] = $queue_status;
-		$outcome['http_status']  = $http['http_status'];
-		$outcome['error_type']   = $http['error_type'];
+		$outcome['result']            = self::result_for_queue_status( $queue_status );
+		$outcome['queue_status']      = $queue_status;
+		$outcome['http_status']       = $http['http_status'];
+		$outcome['error_type']        = $http['error_type'];
+		$outcome['validation_result'] = $verdict['result'];
 
 		$state['completed'] = true;
 
@@ -220,49 +237,39 @@ class SCW_Worker {
 	}
 
 	/**
-	 * Traduce el resultado HTTP al estado terminal de la cola.
+	 * Traduce el estado terminal de la cola al vocabulario del Worker.
 	 *
-	 * Regla de F3: sólo 2xx es success. 3xx (no se siguen redirects), 4xx,
-	 * 5xx y cualquier error de transporte son failed. No hay reintentos.
+	 * La decisión de CUÁL es ese estado la toma SCW_Content_Validator; aquí
+	 * sólo se traduce para el valor de retorno.
 	 *
-	 * @param array $http Resultado de SCW_HTTP_Client::fetch().
+	 * @param string $queue_status Estado terminal aplicado a la cola.
 	 * @return string
 	 */
-	private static function status_for_http_result( $http ) {
-		if ( ! $http['ok'] ) {
-			return SCW_Queue::STATUS_FAILED;
+	private static function result_for_queue_status( $queue_status ) {
+		if ( SCW_Queue::STATUS_SUCCESS === $queue_status ) {
+			return self::RESULT_SUCCESS;
 		}
 
-		$code = (int) $http['http_status'];
-
-		if ( $code >= 200 && $code < 300 ) {
-			return SCW_Queue::STATUS_SUCCESS;
+		if ( SCW_Queue::STATUS_SUSPICIOUS === $queue_status ) {
+			return self::RESULT_SUSPICIOUS;
 		}
 
-		return SCW_Queue::STATUS_FAILED;
+		return self::RESULT_FAILED;
 	}
 
 	/**
-	 * Construye el last_result legible que se guarda en la cola.
+	 * Combina los diagnósticos del cliente HTTP y de la validación en la forma
+	 * que espera SCW_Runs.
 	 *
-	 * @param array $http Resultado de SCW_HTTP_Client::fetch().
-	 * @return string
-	 */
-	private static function last_result_for_http_result( $http ) {
-		if ( $http['ok'] ) {
-			return 'http_' . (int) $http['http_status'];
-		}
-
-		return null === $http['error_type'] ? 'transport_error' : $http['error_type'];
-	}
-
-	/**
-	 * Combina los diagnósticos del cliente HTTP en la forma que espera SCW_Runs.
+	 * Los datos de transporte (redirect_location, possibly_truncated,
+	 * content_length_header) se mantienen en la raíz, como en F3; la evidencia
+	 * de contenido se añade en sus propios bloques. El body nunca entra aquí.
 	 *
-	 * @param array $http Resultado de SCW_HTTP_Client::fetch().
+	 * @param array $http    Resultado de SCW_HTTP_Client::fetch().
+	 * @param array $verdict Resultado de SCW_Content_Validator::validate().
 	 * @return array|null
 	 */
-	private static function build_diagnostics( $http ) {
+	private static function build_diagnostics( $http, $verdict = array() ) {
 		$diagnostics = array();
 
 		if ( ! empty( $http['redirect_location'] ) ) {
@@ -271,6 +278,10 @@ class SCW_Worker {
 
 		if ( ! empty( $http['diagnostics'] ) && is_array( $http['diagnostics'] ) ) {
 			$diagnostics = array_merge( $diagnostics, $http['diagnostics'] );
+		}
+
+		if ( ! empty( $verdict['diagnostics'] ) && is_array( $verdict['diagnostics'] ) ) {
+			$diagnostics = array_merge( $diagnostics, $verdict['diagnostics'] );
 		}
 
 		return empty( $diagnostics ) ? null : $diagnostics;
