@@ -151,7 +151,14 @@ SCW_State::set( array( 'session_id' => $scw_source ) );
 $scw_ins  = $scw_enqueue( '200' );
 $scw_check( 'La URL se ha encolado', (bool) $scw_ins['inserted'], 'id=' . var_export( $scw_ins['id'], true ) );
 
-$scw_mock   = $scw_install_mock( $scw_response( 200, array( 'x-litespeed-cache' => 'miss', 'content-type' => 'text/html' ), '<html>ok</html>' ) );
+// F4.4: el cuerpo simulado debe ser un documento válido y suficientemente
+// grande. Desde F4.4 la validación de contenido es real, y un cuerpo de 15
+// bytes sería una anomalía fuerte (body_too_small) que daría 'suspicious'.
+$scw_body_ok = '<!DOCTYPE html><html lang="es"><head><title>Servisello</title></head><body>'
+	. '<ul class="products">' . str_repeat( '<li class="product">Sello</li>', 900 ) . '</ul>'
+	. '</body></html>';
+
+$scw_mock   = $scw_install_mock( $scw_response( 200, array( 'x-litespeed-cache' => 'miss', 'content-type' => 'text/html' ), $scw_body_ok ) );
 $scw_result = SCW_Worker::run_once();
 $scw_calls  = $scw_mock['calls']();
 $scw_mock['remove']();
@@ -170,8 +177,8 @@ $scw_check( 'Se ha creado una fila en scw_runs', null !== $scw_run );
 $scw_check( 'scw_runs.http_status = 200', $scw_run && 200 === (int) $scw_run['http_status'] );
 $scw_check( 'scw_runs.queue_id correcto', $scw_run && $scw_ins['id'] === (int) $scw_run['queue_id'] );
 $scw_check( 'scw_runs.x_litespeed_cache = miss', $scw_run && 'miss' === $scw_run['x_litespeed_cache'] );
-$scw_check( 'scw_runs.validation_result es NULL (reservado para F4)', $scw_run && null === $scw_run['validation_result'] );
-$scw_check( 'scw_runs.yith_presets es NULL (reservado para F4)', $scw_run && null === $scw_run['yith_presets'] );
+$scw_check( "scw_runs.validation_result = 'ok' (F4.4)", $scw_run && SCW_Content_Validator::RESULT_OK === $scw_run['validation_result'], 'validation_result=' . var_export( $scw_run ? $scw_run['validation_result'] : null, true ) );
+$scw_check( 'scw_runs.yith_presets es NULL: la URL de prueba no espera YITH y el HTML no lo trae', $scw_run && null === $scw_run['yith_presets'], 'yith_presets=' . var_export( $scw_run ? $scw_run['yith_presets'] : null, true ) );
 $scw_check( 'scw_runs.session_id coincide con la sesión activa', $scw_run && $scw_source === $scw_run['session_id'] );
 
 // --- 3. HTTP 3xx / 4xx / 5xx / WP_Error -> failed ------------------------------------
