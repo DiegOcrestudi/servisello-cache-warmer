@@ -47,6 +47,7 @@ require_once SCW_PLUGIN_DIR . 'includes/validation/class-scw-page-profile.php';
 require_once SCW_PLUGIN_DIR . 'includes/validation/class-scw-yith-validator.php';
 require_once SCW_PLUGIN_DIR . 'includes/validation/class-scw-content-validator.php';
 require_once SCW_PLUGIN_DIR . 'includes/runner/class-scw-worker.php';
+require_once SCW_PLUGIN_DIR . 'includes/runner/class-scw-tick-planner.php';
 require_once SCW_PLUGIN_DIR . 'includes/runner/class-scw-scheduler.php';
 require_once SCW_PLUGIN_DIR . 'includes/admin/class-scw-admin.php';
 require_once SCW_PLUGIN_DIR . 'includes/class-scw-activator.php';
