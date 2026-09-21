@@ -17,7 +17,12 @@
  *   wp eval-file wp-content/plugins/servisello-cache-warmer/tests/f5-2-retry-test.php
  *
  * Todas las filas llevan source = 'f5-2-test' y se eliminan al final. El
- * estado del plugin y los ajustes modificados se restauran siempre.
+ * estado del plugin se restaura siempre. El test NO modifica ningún ajuste:
+ * sólo comprueba al final que http_retry_delays sigue intacto.
+ *
+ * Si la cola contiene trabajo abierto ajeno (filas pending o processing con
+ * otro source), la suite se ABORTA antes de escribir nada y sale con código 1.
+ * Ver la guarda de aislamiento más abajo.
  *
  * @package Servisello_Cache_Warmer
  */
@@ -159,8 +164,55 @@ echo 'http_retry_delays configurado: ' . wp_json_encode( SCW_Retry_Policy::confi
 echo 'http_max_retries: ' . var_export( SCW_Settings::get( 'http_max_retries' ), true ) . "\n\n";
 
 $scw_original_state  = SCW_State::all();
-$scw_original_delays = SCW_Settings::get( 'http_retry_delays' );
+$scw_original_delays = SCW_Settings::get( 'http_retry_delays' ); // Sólo para comprobar al final que no ha cambiado.
 $scw_initial_stats   = SCW_Queue::stats();
+
+// ---------------------------------------------------------------------------
+// Guarda de aislamiento
+// ---------------------------------------------------------------------------
+// SCW_Queue::claim() y SCW_Worker::run_once() trabajan sobre la fila pending de
+// mayor prioridad de TODA la tabla, y run_once() recupera además cualquier
+// lease caducado, sea de quien sea. Si la cola tiene trabajo abierto que no es
+// de este test, los bloques C y D lo reclamarían y lo modificarían contra los
+// mocks HTTP: se ha comprobado que una fila ajena de prioridad alta acaba
+// aplazada con el reloj sintético y cerrada como failed.
+//
+// Por eso, si existe CUALQUIER fila pending o processing con un source distinto
+// del de este test, la suite se aborta aquí: antes de la primera escritura del
+// test, y por tanto antes de modificar ninguna fila. Esta comprobación es de
+// sólo lectura.
+global $wpdb;
+
+$scw_foreign_sql = 'FROM ' . SCW_Queue::table() . ' WHERE status IN (%s, %s) AND ( source IS NULL OR source <> %s )';
+
+$scw_foreign_total = (int) $wpdb->get_var( // phpcs:ignore WordPress.DB
+	$wpdb->prepare( 'SELECT COUNT(*) ' . $scw_foreign_sql, SCW_Queue::STATUS_PENDING, SCW_Queue::STATUS_PROCESSING, $scw_source )
+);
+
+if ( $scw_foreign_total > 0 ) {
+	$scw_foreign_rows = $wpdb->get_results( // phpcs:ignore WordPress.DB
+		$wpdb->prepare( 'SELECT id, status, source, priority, url ' . $scw_foreign_sql . ' ORDER BY priority DESC, id ASC LIMIT 5', SCW_Queue::STATUS_PENDING, SCW_Queue::STATUS_PROCESSING, $scw_source ),
+		ARRAY_A
+	);
+
+	echo "  [ABORTADO]  La cola contiene {$scw_foreign_total} fila(s) pending/processing ajenas a este test.\n";
+	echo "              El test NO se ejecuta, para no reclamar ni modificar datos reales.\n";
+	echo "              No se ha escrito nada: ni filas de cola, ni runs, ni estado del plugin.\n\n";
+	echo "              Primeras filas ajenas encontradas:\n";
+
+	foreach ( (array) $scw_foreign_rows as $scw_foreign_row ) {
+		echo '                id=' . $scw_foreign_row['id']
+			. ' status=' . $scw_foreign_row['status']
+			. ' source=' . var_export( $scw_foreign_row['source'], true )
+			. ' priority=' . $scw_foreign_row['priority']
+			. ' url=' . $scw_foreign_row['url'] . "\n";
+	}
+
+	echo "\n              Vacía o termina ese trabajo y vuelve a ejecutar la suite.\n";
+	echo "\n=== SUITE ABORTADA: trabajo ajeno en la cola. 0 comprobaciones ejecutadas. ===\n\n";
+
+	exit( 1 );
+}
 
 SCW_State::set( array( 'session_id' => $scw_source ) );
 
@@ -218,7 +270,7 @@ $scw_check( 'La decisión informa de que la clase no era recuperable', false ===
 echo "\nB. Límite de intentos\n";
 
 $scw_d = SCW_Retry_Policy::decide( $scw_ctx( array( 'attempts' => 1, 'max_attempts' => 2 ) ) );
-$scw_check( 'attempts 1/2 con 503 -> retry', SCW_Retry_Policy::DECISION_RETRY === $scw_d['decision'], 'decision=' . $scw_d['decision'] );
+$scw_check( 'attempts 1/2 con HTTP 500 -> retry', SCW_Retry_Policy::DECISION_RETRY === $scw_d['decision'], 'decision=' . $scw_d['decision'] );
 $scw_check( 'attempts_left = 1', 1 === $scw_d['attempts_left'] );
 $scw_check( 'El motivo es retry_scheduled', SCW_Retry_Policy::REASON_RETRY_SCHEDULED === $scw_d['reason'] );
 
@@ -353,7 +405,17 @@ $scw_run   = SCW_Runs::find_latest_by_queue_id( $scw_row['id'] );
 $scw_check( '503 con intentos disponibles -> result = retry', SCW_Worker::RESULT_RETRY === $scw_out['result'], 'result=' . $scw_out['result'] );
 $scw_check( 'La fila vuelve a pending', $scw_after && SCW_Queue::STATUS_PENDING === $scw_after['status'], 'status=' . ( $scw_after ? $scw_after['status'] : 'n/a' ) );
 $scw_check( 'available_at queda en el futuro', $scw_after && strtotime( $scw_after['available_at'] . ' UTC' ) > time(), 'available_at=' . ( $scw_after ? $scw_after['available_at'] : 'n/a' ) );
-$scw_check( 'El backoff aplicado es el primer escalón', $scw_after && ( strtotime( $scw_after['available_at'] . ' UTC' ) - time() ) > ( SCW_Retry_Policy::backoff_delay( 1 ) - 5 ) );
+// available_at = now + escalón, con now tomado dentro de run_once(). Al leerlo
+// aquí ya ha pasado algo de tiempo, así que la espera restante está en
+// [escalón - tolerancia, escalón]. Una cota inferior sola no bastaría: también
+// la cumpliría el segundo escalón.
+$scw_step1     = SCW_Retry_Policy::backoff_delay( 1 );
+$scw_remaining = $scw_after ? strtotime( $scw_after['available_at'] . ' UTC' ) - time() : null;
+$scw_check(
+	'El backoff aplicado es exactamente el primer escalón',
+	null !== $scw_remaining && $scw_remaining <= $scw_step1 && $scw_remaining >= $scw_step1 - 5,
+	'espera restante=' . var_export( $scw_remaining, true ) . 's, primer escalón=' . $scw_step1 . 's, ventana=[' . ( $scw_step1 - 5 ) . ', ' . $scw_step1 . ']'
+);
 $scw_check( 'lock liberado', $scw_after && null === $scw_after['lock_token'] && null === $scw_after['locked_at'] );
 $scw_check( 'Exactamente 1 petición HTTP en el ciclo', 1 === $scw_calls, 'llamadas=' . $scw_calls );
 $scw_check( 'Se ha creado su fila en scw_runs', null !== $scw_run );
@@ -397,13 +459,50 @@ $scw_check( 'Las filas de runs de los reintentos son distintas', 2 === count( ar
 $scw_attempts_logged = $wpdb->get_col( $wpdb->prepare( 'SELECT attempt FROM ' . SCW_Runs::table() . ' WHERE queue_id = %d ORDER BY attempt ASC', $scw_row['id'] ) ); // phpcs:ignore WordPress.DB
 $scw_check( 'Los runs registran los intentos 1, 2 y 3', array( '1', '2', '3' ) === array_map( 'strval', $scw_attempts_logged ), implode( ',', $scw_attempts_logged ) );
 
-// No debe existir un 4.º intento: la fila ya es terminal y no es reclamable.
-$scw_mock  = $scw_install_mock( $scw_response( 503, array(), '' ) );
-$scw_out4  = SCW_Worker::run_once();
-$scw_mock['remove']();
+// No debe existir un 4.º intento.
+//
+// Aislamiento: run_once() reclama la fila pending de mayor prioridad de TODA la
+// tabla, y antes recupera cualquier lease caducado, sea del test o no. En este
+// punto todas las filas del test ya son terminales, así que un run_once() sin
+// protección trabajaría sobre una fila REAL de la cola, si la hubiera, contra
+// el mock 503. Por eso la comprobación va en dos capas:
+//
+//   1. Siempre, y sin modificar nada: la fila está agotada y get_next(), que es
+//      de sólo lectura, no puede devolverla.
+//   2. Sólo si no existe trabajo abierto ajeno al test (pending o processing
+//      con otro source): run_once() de verdad, exigiendo que no reclame nada y
+//      no haga ninguna petición. Si hay trabajo ajeno, se omite y se avisa.
+$scw_final_row = SCW_Queue::get( $scw_row['id'] );
 
-$scw_check( 'No hay un 4.º intento sobre esa URL', $scw_out4['queue_id'] !== (int) $scw_row['id'], 'queue_id=' . var_export( $scw_out4['queue_id'], true ) );
-$scw_check( 'La fila sigue en failed', SCW_Queue::STATUS_FAILED === SCW_Queue::get( $scw_row['id'] )['status'] );
+$scw_check( 'La fila agotada es terminal: failed', $scw_final_row && SCW_Queue::STATUS_FAILED === $scw_final_row['status'], 'status=' . ( $scw_final_row ? $scw_final_row['status'] : 'n/a' ) );
+$scw_check( 'attempts = max_attempts: no queda margen para otro intento', $scw_final_row && (int) $scw_final_row['attempts'] === (int) $scw_final_row['max_attempts'], 'attempts=' . ( $scw_final_row ? $scw_final_row['attempts'] . '/' . $scw_final_row['max_attempts'] : 'n/a' ) );
+
+$scw_next = SCW_Queue::get_next();
+$scw_check( 'get_next() (sólo lectura) no puede devolver la fila agotada', ! $scw_next || (int) $scw_next['id'] !== (int) $scw_row['id'], 'get_next=' . ( $scw_next ? $scw_next['id'] : 'null' ) );
+
+$scw_foreign_open = (int) $wpdb->get_var( // phpcs:ignore WordPress.DB
+	$wpdb->prepare(
+		'SELECT COUNT(*) FROM ' . SCW_Queue::table() . ' WHERE status IN (%s, %s) AND ( source IS NULL OR source <> %s )',
+		SCW_Queue::STATUS_PENDING,
+		SCW_Queue::STATUS_PROCESSING,
+		$scw_source
+	)
+);
+
+if ( 0 === $scw_foreign_open ) {
+	$scw_mock  = $scw_install_mock( $scw_response( 503, array(), '' ) );
+	$scw_out4  = SCW_Worker::run_once();
+	$scw_calls = $scw_mock['calls']();
+	$scw_mock['remove']();
+
+	$scw_check( 'run_once() no reclama ninguna fila: queue_id = null', null === $scw_out4['queue_id'], 'queue_id=' . var_export( $scw_out4['queue_id'], true ) );
+	$scw_check( 'run_once() no hace ninguna petición HTTP', 0 === $scw_calls, 'llamadas=' . $scw_calls );
+	$scw_check( 'La fila sigue en failed tras el ciclo', SCW_Queue::STATUS_FAILED === SCW_Queue::get( $scw_row['id'] )['status'] );
+} else {
+	echo "  [AVISO]  Hay {$scw_foreign_open} fila(s) pending/processing ajenas al test en la cola.\n";
+	echo "           Se omite el run_once() del 4.º intento para no reclamar ni modificar\n";
+	echo "           datos reales. La comprobación de sólo lectura de arriba sigue siendo válida.\n";
+}
 
 // D.3 Error retryable sin intentos -> failed en el primer ciclo.
 SCW_Queue::delete_by_source( $scw_source );
@@ -511,8 +610,6 @@ $scw_check( 'Diagnóstico: próxima disponibilidad disponible', null !== $scw_af
 // ---------------------------------------------------------------------------
 echo "\nE. Limpieza\n";
 
-SCW_Settings::update( array( 'http_retry_delays' => $scw_original_delays ) );
-
 $scw_deleted_queue = SCW_Queue::delete_by_source( $scw_source );
 $scw_deleted_runs  = SCW_Runs::delete_by_session( $scw_source );
 
@@ -523,7 +620,7 @@ $scw_final = SCW_Queue::stats();
 $scw_check( 'Filas de cola eliminadas', $scw_deleted_queue > 0, $scw_deleted_queue . ' filas' );
 $scw_check( 'Filas de runs eliminadas', $scw_deleted_runs > 0, $scw_deleted_runs . ' filas' );
 $scw_check( 'La cola vuelve a su recuento inicial', (int) $scw_final['total'] === (int) $scw_initial_stats['total'], 'total=' . $scw_final['total'] . ' inicial=' . $scw_initial_stats['total'] );
-$scw_check( 'http_retry_delays restaurado', SCW_Settings::get( 'http_retry_delays' ) === $scw_original_delays );
+$scw_check( 'El test no ha modificado http_retry_delays', SCW_Settings::get( 'http_retry_delays' ) === $scw_original_delays, 'valor=' . wp_json_encode( SCW_Settings::get( 'http_retry_delays' ) ) );
 $scw_check( 'El esquema sigue en la versión 2', '2' === (string) get_option( SCW_Schema::OPTION_DB_VERSION ) );
 
 echo "\n=== Resultado: {$scw_pass} correctas, {$scw_fail} fallidas ===\n\n";
