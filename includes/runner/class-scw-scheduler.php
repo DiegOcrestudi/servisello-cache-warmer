@@ -161,21 +161,17 @@ class SCW_Scheduler {
 
 			if ( SCW_Worker::RESULT_EMPTY === $result['result'] ) {
 				SCW_Logger::info( SCW_Logger::CODE_QUEUE_EMPTY, 'La cola no tiene URLs pendientes en este tick.' );
-			} else {
-				SCW_Logger::info(
-					SCW_Logger::CODE_TICK_OK,
-					'Tick ejecutado.',
-					array(
-						'queue_id'     => $result['queue_id'],
-						'queue_status' => $result['queue_status'],
-						'http_status'  => $result['http_status'],
-						'error_type'   => $result['error_type'],
-					)
-				);
 			}
 
+			// Un tick productivo NO escribe ningún evento de éxito: el latido
+			// son last_tick_at y expected_next_tick_at. scw_events queda
+			// reservada a scheduler, leases, breaker y fallos internos.
+
 			if ( SCW_State::is_running() ) {
-				self::schedule_next_tick();
+				// ÚNICA decisión temporal del sistema. El Scheduler no calcula
+				// ningún retardo por su cuenta: sólo aplica lo que decide
+				// SCW_Tick_Planner.
+				self::apply_plan( SCW_Tick_Planner::plan( SCW_Tick_Planner::context() ) );
 			}
 		} finally {
 			self::release_tick_lock();
@@ -217,12 +213,136 @@ class SCW_Scheduler {
 	}
 
 	/**
+	 * Aplica una decisión de SCW_Tick_Planner.
+	 *
+	 * El Scheduler NO inventa ninguna decisión temporal propia: se limita a
+	 * ejecutar la que recibe.
+	 *
+	 * @param array $plan Decisión devuelta por SCW_Tick_Planner::plan().
+	 * @return bool True si la decisión se ha aplicado con éxito.
+	 */
+	public static function apply_plan( $plan ) {
+		if ( ! is_array( $plan ) || ! isset( $plan['action'] ) ) {
+			return false;
+		}
+
+		if ( SCW_Tick_Planner::ACTION_SCHEDULE === $plan['action'] ) {
+			return self::arm_tick( $plan['at'] );
+		}
+
+		if ( SCW_Tick_Planner::ACTION_STOP === $plan['action'] ) {
+			return self::stop_run( isset( $plan['reason'] ) ? (string) $plan['reason'] : '' );
+		}
+
+		// ACTION_NONE: el crawler no está RUNNING. No se programa nada y no se
+		// toca el estado.
+		return false;
+	}
+
+	/**
+	 * Arma el siguiente scw_tick en un timestamp concreto.
+	 *
+	 * Sustituye a la limitación de schedule_next_tick(), que era idempotente
+	 * por presencia: si ya existía un tick programado devolvía true sin mirar
+	 * el retardo solicitado, de modo que cualquier intento de cambiar el
+	 * momento del siguiente tick era un no-op silencioso. Con pacing adaptativo
+	 * y circuit breaker eso haría inaplicable la decisión del planificador.
+	 *
+	 * Para evitar duplicados, un tick ya programado en otro instante se elimina
+	 * ANTES de crear el nuevo. Si ya está armado exactamente en el timestamp
+	 * pedido, no se toca el cron: la operación es idempotente.
+	 *
+	 * expected_next_tick_at se actualiza únicamente cuando queda un tick
+	 * realmente armado. No se registra ningún evento de éxito.
+	 *
+	 * @param int $timestamp Momento en que debe ejecutarse el tick.
+	 * @return bool True si queda un tick armado en ese timestamp.
+	 */
+	public static function arm_tick( $timestamp ) {
+		$timestamp = max( time(), (int) $timestamp );
+		$existing  = (int) wp_next_scheduled( self::HOOK_TICK );
+
+		if ( $existing === $timestamp ) {
+			SCW_State::set( array( 'expected_next_tick_at' => $timestamp ) );
+
+			return true;
+		}
+
+		if ( $existing ) {
+			wp_clear_scheduled_hook( self::HOOK_TICK );
+		}
+
+		$scheduled = wp_schedule_single_event( $timestamp, self::HOOK_TICK, array(), true );
+
+		if ( false === $scheduled || is_wp_error( $scheduled ) ) {
+			SCW_Logger::error(
+				SCW_Logger::CODE_CRON_NOT_SCHEDULED,
+				'No se ha podido armar el siguiente scw_tick.',
+				array(
+					'timestamp' => $timestamp,
+					'delay'     => $timestamp - time(),
+					'error'     => is_wp_error( $scheduled ) ? $scheduled->get_error_message() : null,
+				)
+			);
+
+			return false;
+		}
+
+		SCW_State::set( array( 'expected_next_tick_at' => $timestamp ) );
+
+		return true;
+	}
+
+	/**
+	 * Elimina el tick programado, si lo hay, y limpia la expectativa.
+	 *
+	 * No toca el watchdog, a diferencia de unschedule_all().
+	 *
+	 * @return void
+	 */
+	public static function clear_tick() {
+		wp_clear_scheduled_hook( self::HOOK_TICK );
+		SCW_State::set( array( 'expected_next_tick_at' => 0 ) );
+	}
+
+	/**
+	 * Detiene el run porque no queda trabajo de ninguna clase.
+	 *
+	 * Sustituye al encadenado indefinido de F3, en el que una cola vacía seguía
+	 * generando un tick cada pace_base_delay segundos, y con él un evento
+	 * QUEUE_EMPTY, indefinidamente.
+	 *
+	 * @param string $reason Motivo devuelto por el planificador.
+	 * @return bool
+	 */
+	private static function stop_run( $reason ) {
+		self::clear_tick();
+
+		SCW_State::set(
+			array(
+				'run_status'    => SCW_State::STATUS_STOPPED,
+				'status_reason' => 'Cola agotada: no quedan URLs pendientes ni en proceso.',
+			)
+		);
+
+		SCW_Logger::info(
+			SCW_Logger::CODE_RUN_STOPPED,
+			'Crawler detenido: la cola está agotada.',
+			array( 'reason' => $reason )
+		);
+
+		return true;
+	}
+
+	/**
 	 * Programa el siguiente scw_tick si no hay ya uno pendiente.
 	 *
-	 * Modelo de cadena (wp_schedule_single_event encadenado), sin cron
-	 * recurrente para el warmer. El retardo reutiliza de forma mínima el
-	 * ajuste existente pace_base_delay como intervalo FIJO: no hay ninguna
-	 * lógica adaptativa aquí, eso es F5.
+	 * Se conserva con su contrato de F3 intacto (idempotente por presencia)
+	 * porque el panel de administración lo utiliza para arrancar la cadena. La
+	 * programación real la hace arm_tick(), de modo que sigue existiendo un
+	 * único punto que habla con WP-Cron.
+	 *
+	 * Para CAMBIAR el momento de un tick ya programado hay que usar arm_tick().
 	 *
 	 * @param int|null $delay_seconds Retardo explícito en segundos. Null usa
 	 *                                el ajuste pace_base_delay.
@@ -235,21 +355,7 @@ class SCW_Scheduler {
 
 		$delay = null === $delay_seconds ? self::next_tick_delay() : max( 0, (int) $delay_seconds );
 
-		$scheduled = wp_schedule_single_event( time() + $delay, self::HOOK_TICK, array(), true );
-
-		if ( false === $scheduled || is_wp_error( $scheduled ) ) {
-			SCW_Logger::error(
-				SCW_Logger::CODE_CRON_NOT_SCHEDULED,
-				'No se ha podido programar el siguiente scw_tick.',
-				array(
-					'delay' => $delay,
-					'error' => is_wp_error( $scheduled ) ? $scheduled->get_error_message() : null,
-				)
-			);
-			return false;
-		}
-
-		return true;
+		return self::arm_tick( time() + $delay );
 	}
 
 	/**

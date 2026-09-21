@@ -82,9 +82,44 @@ class SCW_Settings {
 				'unknown'     => 50,
 			),
 
+			// --- Cola ------------------------------------------------------------
+			/*
+			 * Duración del lease de una fila reclamada, en segundos.
+			 *
+			 * SCW_Queue::lease_seconds() ya leía esta clave desde F2.1, pero no
+			 * estaba declarada aquí: el valor efectivo salía siempre de la
+			 * constante SCW_Queue::DEFAULT_LEASE_SECONDS. F5.0 la declara con ese
+			 * mismo valor, de modo que el comportamiento no cambia y el ajuste
+			 * deja de ser invisible.
+			 *
+			 * No confundir con SCW_Scheduler::TICK_LOCK_SECONDS, que acota la
+			 * duración de un tick en vuelo. Son dos cosas distintas.
+			 */
+			'queue_lease_seconds'      => 120,
+
 			// --- HTTP ----------------------------------------------------------
 			'http_timeout'             => 30,
-			'http_max_retries'         => 2,
+			/*
+			 * Reintentos HTTP permitidos DESPUÉS del primer intento.
+			 *
+			 * F5.0 (decisión C7): el valor por defecto baja de 2 a 1 para que el
+			 * límite derivado de una fila de cola,
+			 *
+			 *     max_attempts = http_max_retries + 1
+			 *
+			 * siga valiendo 2, que es exactamente SCW_Queue::DEFAULT_MAX_ATTEMPTS
+			 * y el DEFAULT de la columna max_attempts en el esquema. Así se añade
+			 * la derivación sin romper el contrato de F2.1.
+			 *
+			 * IMPORTANTE: este ajuste sólo interviene en el momento del INSERT de
+			 * una fila de cola. El valor resultante queda CONGELADO en la columna
+			 * max_attempts de esa fila. Cambiarlo después no altera ninguna fila
+			 * existente; sólo afecta a las que se inserten a partir de entonces.
+			 *
+			 * La política de reintentos como tal (qué errores son reintentables,
+			 * cuándo se aplaza una fila) es F5.2 y todavía no existe.
+			 */
+			'http_max_retries'         => 1,
 			'http_retry_delays'        => array( 30, 90 ),
 			'http_max_redirects'       => 2,
 			'user_agent'               => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 ServiselloCacheWarmer/1.0',
@@ -112,6 +147,17 @@ class SCW_Settings {
 			'breaker_429_window'         => 600,
 			'breaker_slow10_consecutive' => 3,
 			'breaker_slow6_consecutive'  => 5,
+			/*
+			 * INACTIVOS EN F5 (decisión C2).
+			 *
+			 * Estos dos ajustes existen desde F1 y se conservan por
+			 * compatibilidad, pero NO se implementa la condición de apertura por
+			 * porcentaje de fallos en ventana: exigiría una ventana deslizante
+			 * persistida que no existe, y con colas pequeñas una ventana de 20
+			 * nunca llegaría a llenarse, así que no podría validarse.
+			 *
+			 * Ningún código los lee. No los consumas sin reabrir la decisión.
+			 */
 			'breaker_window_size'        => 20,
 			'breaker_window_failure_pct' => 40,
 			'breaker_cooldown'           => 300,

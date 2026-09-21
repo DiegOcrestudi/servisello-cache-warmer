@@ -112,11 +112,11 @@ $scw_response = function ( $code, array $headers = array(), $body = 'ok' ) {
  * @param string $suffix Sufijo para distinguir varias URLs.
  * @return array Resultado de SCW_Queue::insert().
  */
-$scw_enqueue = function ( $suffix ) use ( $scw_source ) {
+$scw_enqueue = function ( $suffix, $extra = array() ) use ( $scw_source ) {
 	$settings = SCW_Settings::all();
 	$url      = 'https://' . $settings['allowed_host'] . '/prueba-f3-worker-' . $suffix . '/';
 
-	return SCW_Queue::insert( $url, array( 'source' => $scw_source ) );
+	return SCW_Queue::insert( $url, array_merge( array( 'source' => $scw_source ), $extra ) );
 };
 
 echo "\n=== F3 · TEST: worker y scheduler ===\n";
@@ -192,7 +192,12 @@ $scw_cases = array(
 );
 
 foreach ( $scw_cases as $scw_label => $scw_canned ) {
-	$scw_ins = $scw_enqueue( 'case-' . $scw_label );
+	// CC-1 (F5.2): desde que existe la política de reintentos, un 5xx o un
+	// WP_Error recuperables ya no son terminales en el PRIMER intento. Esta
+	// sección comprueba la CLASIFICACIÓN del error, no el número de intentos,
+	// así que se encola con max_attempts = 1 para que el primer fallo sea
+	// terminal y la aserción conserve exactamente su intención original.
+	$scw_ins = $scw_enqueue( 'case-' . $scw_label, array( 'max_attempts' => 1 ) );
 
 	$scw_mock   = $scw_install_mock( $scw_canned );
 	$scw_result = SCW_Worker::run_once();

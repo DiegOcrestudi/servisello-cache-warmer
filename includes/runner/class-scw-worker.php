@@ -5,7 +5,13 @@
  * Orquesta un único ciclo: recupera leases caducados, reclama como máximo UNA
  * URL de la cola, la valida, ejecuta como máximo UNA petición HTTP, registra
  * el resultado en scw_runs y completa la fila de la cola usando su
- * lock_token. No implementa reintentos, pacing ni circuit breaker (F5).
+ * lock_token. No implementa pacing ni circuit breaker (F5.3/F5.4).
+ *
+ * F5.2: entre el registro del run y el cierre de la cola se consulta a
+ * SCW_Retry_Policy. Las REGLAS de reintento tampoco viven aquí: el Worker
+ * pregunta y ejecuta, aplazando con SCW_Queue::defer() o cerrando con
+ * SCW_Queue::complete(). Una petición HTTP real sigue generando exactamente
+ * una fila en scw_runs, también cuando es un reintento.
  *
  * Reutiliza siempre las abstracciones existentes: SCW_Queue para el ciclo de
  * vida de la cola, SCW_URL_Normalizer y SCW_URL_Exclusions para decidir si
@@ -32,6 +38,12 @@ class SCW_Worker {
 	const RESULT_FAILED     = 'failed';
 
 	/**
+	 * La petición ha fallado con un error recuperable y quedaban intentos: la
+	 * fila vuelve a pending con un available_at futuro en lugar de cerrarse.
+	 */
+	const RESULT_RETRY = 'retry';
+
+	/**
 	 * Ejecuta un único ciclo de calentamiento.
 	 *
 	 * Como máximo una URL reclamada y como máximo una petición HTTP. Si la
@@ -40,13 +52,16 @@ class SCW_Worker {
 	 * fila en scw_runs: sólo se completa la cola.
 	 *
 	 * @return array {
-	 *     @type string      $result            empty|skipped|success|suspicious|failed.
+	 *     @type string      $result            empty|skipped|success|suspicious|failed|retry.
 	 *     @type int|null    $queue_id
 	 *     @type string|null $queue_status      Estado terminal aplicado a la cola.
 	 *     @type int|null    $http_status
 	 *     @type string|null $error_type
 	 *     @type string|null $validation_result Veredicto de contenido, o null si no lo hubo.
 	 *     @type int         $recovered_leases  Filas recuperadas de leases caducados en este ciclo.
+	 *     @type int|null     $attempts          Intentos consumidos por la URL tras este ciclo.
+	 *     @type int|null     $max_attempts      Techo congelado de la URL.
+	 *     @type array|null   $retry             Decisión de SCW_Retry_Policy, o null si no hubo petición.
 	 * }
 	 */
 	public static function run_once() {
@@ -71,6 +86,9 @@ class SCW_Worker {
 			'error_type'        => null,
 			'validation_result' => null,
 			'recovered_leases'  => 0,
+			'attempts'          => null,
+			'max_attempts'      => null,
+			'retry'             => null,
 		);
 
 		$outcome['recovered_leases'] = self::recover_expired_leases();
@@ -149,17 +167,61 @@ class SCW_Worker {
 			)
 		);
 
-		// 5. Cierre de la cola. Un error HTTP o un HTML dudoso son resultados
+		// 5. Decisión de reintento (F5.2). Las REGLAS no viven aquí: el Worker
+		// pregunta a SCW_Retry_Policy y ejecuta. La política no toca la cola.
+		$retry = SCW_Retry_Policy::decide(
+			SCW_Retry_Policy::context( $claimed, $http, $verdict )
+		);
+
+		$outcome['attempts']     = (int) $claimed['attempts'];
+		$outcome['max_attempts'] = (int) $claimed['max_attempts'];
+		$outcome['retry']        = $retry;
+
+		// 6. Cierre de la cola. Un error HTTP o un HTML dudoso son resultados
 		// de la petición, no fallos del sistema: nunca generan un scw_event,
 		// sólo el estado de la cola y la fila de scw_runs ya creada.
+		if ( SCW_Retry_Policy::DECISION_RETRY === $retry['decision'] ) {
+			// Aplazar NO es cerrar. Se reutiliza SCW_Queue::defer() de F5.0,
+			// que valida processing, exige el lock_token, libera el lock y
+			// conserva attempts y max_attempts. Aquí no se duplica nada de eso.
+			// La fila queda pending con available_at futuro, y el
+			// SCW_Tick_Planner de F5.1 ya sabe planificar sobre ese dato.
+			SCW_Queue::defer(
+				$claimed['id'],
+				$retry['available_at'],
+				array(
+					'lock_token'  => $claimed['lock_token'],
+					'last_result' => $verdict['last_result'],
+					'last_error'  => $http['error_message'],
+				)
+			);
+
+			$outcome['result']            = self::RESULT_RETRY;
+			$outcome['queue_status']      = SCW_Queue::STATUS_PENDING;
+			$outcome['http_status']       = $http['http_status'];
+			$outcome['error_type']        = $http['error_type'];
+			$outcome['validation_result'] = $verdict['result'];
+
+			$state['completed'] = true;
+
+			return $outcome;
+		}
+
 		$queue_status = $verdict['queue_status'];
+
+		// Un fallo recuperable que ya ha agotado los intentos se cierra como
+		// failed dejando constancia del motivo, en lugar del último código
+		// HTTP: es el dato que explica por qué no habrá otro intento.
+		$last_result = ( SCW_Retry_Policy::REASON_RETRIES_EXHAUSTED === $retry['reason'] )
+			? SCW_Retry_Policy::REASON_RETRIES_EXHAUSTED
+			: $verdict['last_result'];
 
 		SCW_Queue::complete(
 			$claimed['id'],
 			$queue_status,
 			array(
 				'lock_token'  => $claimed['lock_token'],
-				'last_result' => $verdict['last_result'],
+				'last_result' => $last_result,
 				'last_error'  => $http['error_message'],
 			)
 		);

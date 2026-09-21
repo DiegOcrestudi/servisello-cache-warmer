@@ -134,10 +134,10 @@ if ( '' === $scw_host ) {
  * @param string $suffix Sufijo.
  * @return array Resultado de SCW_Queue::insert().
  */
-$scw_enqueue = function ( $suffix ) use ( $scw_source, $scw_host ) {
+$scw_enqueue = function ( $suffix, $extra = array() ) use ( $scw_source, $scw_host ) {
 	$url = 'https://' . $scw_host . '/prueba-f4-4-' . $suffix . '/';
 
-	return SCW_Queue::insert( $url, array( 'source' => $scw_source ) );
+	return SCW_Queue::insert( $url, array_merge( array( 'source' => $scw_source ), $extra ) );
 };
 
 /**
@@ -147,8 +147,8 @@ $scw_enqueue = function ( $suffix ) use ( $scw_source, $scw_host ) {
  * @param array|WP_Error $canned Respuesta simulada.
  * @return array { queue_id, outcome, row, run, calls }
  */
-$scw_cycle = function ( $suffix, $canned ) use ( $scw_enqueue, $scw_install_mock ) {
-	$ins = $scw_enqueue( $suffix );
+$scw_cycle = function ( $suffix, $canned, $extra = array() ) use ( $scw_enqueue, $scw_install_mock ) {
+	$ins = $scw_enqueue( $suffix, $extra );
 
 	$mock    = $scw_install_mock( $canned );
 	$outcome = SCW_Worker::run_once();
@@ -279,7 +279,9 @@ $scw_http_cases = array(
 );
 
 foreach ( $scw_http_cases as $scw_label => $scw_canned ) {
-	$scw_r = $scw_cycle( 'http-' . $scw_label, $scw_canned );
+	// CC-1 (F5.2): un solo intento, para seguir comprobando la clasificación
+	// terminal del error y no el número de reintentos. Ver f5-2-retry-test.
+	$scw_r = $scw_cycle( 'http-' . $scw_label, $scw_canned, array( 'max_attempts' => 1 ) );
 
 	$scw_check( "{$scw_label} -> queue_status = 'failed'", SCW_Queue::STATUS_FAILED === $scw_r['outcome']['queue_status'], 'queue_status=' . $scw_r['outcome']['queue_status'] );
 	$scw_check( "{$scw_label} -> validation_result = 'error'", $scw_r['run'] && SCW_Content_Validator::RESULT_ERROR === $scw_r['run']['validation_result'], 'validation_result=' . var_export( $scw_r['run'] ? $scw_r['run']['validation_result'] : null, true ) );
@@ -289,7 +291,7 @@ foreach ( $scw_http_cases as $scw_label => $scw_canned ) {
 	$scw_check( "{$scw_label} -> diagnostics sin bloques de validación", ! isset( $scw_diag['validation'] ) && ! isset( $scw_diag['yith'] ) );
 }
 
-$scw_r = $scw_cycle( 'wp-error', new WP_Error( 'http_request_failed', 'cURL error 28: Operation timed out' ) );
+$scw_r = $scw_cycle( 'wp-error', new WP_Error( 'http_request_failed', 'cURL error 28: Operation timed out' ), array( 'max_attempts' => 1 ) );
 $scw_check( "WP_Error/timeout -> queue_status = 'failed'", SCW_Queue::STATUS_FAILED === $scw_r['outcome']['queue_status'] );
 $scw_check( "WP_Error/timeout -> validation_result = 'error'", $scw_r['run'] && SCW_Content_Validator::RESULT_ERROR === $scw_r['run']['validation_result'] );
 $scw_check( 'WP_Error/timeout -> se ha registrado el error_type', $scw_r['run'] && null !== $scw_r['run']['error_type'], 'error_type=' . var_export( $scw_r['run'] ? $scw_r['run']['error_type'] : null, true ) );
