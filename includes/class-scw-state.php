@@ -40,6 +40,10 @@ class SCW_State {
 			'session_started_at'   => 0,
 			'current_delay'        => 0,
 			'ewma_duration_ms'     => 0,
+			// F5.3: fin de la última petición HTTP real (time() tras fetch()).
+			// Lo escribe SCW_Worker junto con current_delay y ewma_duration_ms;
+			// lo lee SCW_Tick_Planner. Declarado aquí para que reset() lo limpie.
+			'last_request_at'      => 0,
 			'last_tick_at'         => 0,
 			'expected_next_tick_at' => 0,
 			'last_watchdog_at'     => 0,

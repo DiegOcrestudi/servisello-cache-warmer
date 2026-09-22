@@ -5,13 +5,20 @@
  * Orquesta un único ciclo: recupera leases caducados, reclama como máximo UNA
  * URL de la cola, la valida, ejecuta como máximo UNA petición HTTP, registra
  * el resultado en scw_runs y completa la fila de la cola usando su
- * lock_token. No implementa pacing ni circuit breaker (F5.3/F5.4).
+ * lock_token. No implementa circuit breaker (F5.4).
  *
  * F5.2: entre el registro del run y el cierre de la cola se consulta a
  * SCW_Retry_Policy. Las REGLAS de reintento tampoco viven aquí: el Worker
  * pregunta y ejecuta, aplazando con SCW_Queue::defer() o cerrando con
  * SCW_Queue::complete(). Una petición HTTP real sigue generando exactamente
  * una fila en scw_runs, también cuando es un reintento.
+ *
+ * F5.3: inmediatamente después de SCW_HTTP_Client::fetch(), y sólo si la
+ * petición ha llegado al servidor, se consulta a SCW_Pacer y se persisten
+ * current_delay, ewma_duration_ms y last_request_at en UNA escritura de
+ * SCW_State. Las reglas de ritmo no viven aquí, y el Worker tampoco decide
+ * cuándo se ejecuta el siguiente tick: eso lo hace SCW_Tick_Planner leyendo
+ * esos dos hechos. Las rutas empty y skipped no tocan el estado de pacing.
  *
  * Reutiliza siempre las abstracciones existentes: SCW_Queue para el ciclo de
  * vida de la cola, SCW_URL_Normalizer y SCW_URL_Exclusions para decidir si
@@ -62,6 +69,8 @@ class SCW_Worker {
 	 *     @type int|null     $attempts          Intentos consumidos por la URL tras este ciclo.
 	 *     @type int|null     $max_attempts      Techo congelado de la URL.
 	 *     @type array|null   $retry             Decisión de SCW_Retry_Policy, o null si no hubo petición.
+	 *     @type array|null   $pace              Resultado de SCW_Pacer::compute() ({delay, ewma, band}),
+	 *                                           o null si no hubo petición real.
 	 * }
 	 */
 	public static function run_once() {
@@ -89,6 +98,7 @@ class SCW_Worker {
 			'attempts'          => null,
 			'max_attempts'      => null,
 			'retry'             => null,
+			'pace'              => null,
 		);
 
 		$outcome['recovered_leases'] = self::recover_expired_leases();
@@ -134,6 +144,17 @@ class SCW_Worker {
 		$session_id = (string) SCW_State::get( 'session_id', '' );
 
 		$http = SCW_HTTP_Client::fetch( $claimed['url'] );
+
+		// Fin de la petición (F5.3, OD-2): se toma aquí, inmediatamente después
+		// de fetch(), y es el único reloj que usa el pacing.
+		$request_finished_at = time();
+
+		// 2b. Pacing (F5.3). Antes de la validación de contenido: el hecho "el
+		// servidor ha recibido una petición" no depende del veredicto, y
+		// persistirlo cuanto antes reduce la ventana en la que un fatal
+		// posterior dejaría el sistema sin ritmo. Usa exactamente el
+		// duration_ms de fetch(), el mismo que se registra en scw_runs.
+		$outcome['pace'] = self::apply_pacing( $http, $request_finished_at );
 
 		// 3. Validación de contenido (F4.4). Es el único punto donde el body
 		// está disponible; se consume aquí y se suelta al terminar el ciclo.
@@ -235,6 +256,42 @@ class SCW_Worker {
 		$state['completed'] = true;
 
 		return $outcome;
+	}
+
+	/**
+	 * Calcula y persiste el pacing de una petición.
+	 *
+	 * Las reglas son de SCW_Pacer. Aquí sólo se decide SI procede (petición
+	 * real) y se hace la ÚNICA escritura de pacing del sistema: current_delay,
+	 * ewma_duration_ms y last_request_at en una sola llamada a SCW_State::set().
+	 *
+	 * Los rechazos previos a la red de SCW_HTTP_Client (invalid_url,
+	 * host_not_allowed) no han cargado el servidor y no actualizan nada.
+	 *
+	 * @param array $http        Resultado de SCW_HTTP_Client::fetch(), sin tocar.
+	 * @param int   $finished_at time() inmediatamente posterior a fetch().
+	 * @return array|null Resultado del pacer, o null si no hubo petición real.
+	 */
+	private static function apply_pacing( $http, $finished_at ) {
+		if ( ! SCW_Pacer::is_real_request( $http ) ) {
+			return null;
+		}
+
+		$pace = SCW_Pacer::compute(
+			$http,
+			(int) SCW_State::get( 'ewma_duration_ms', 0 ),
+			SCW_Pacer::config()
+		);
+
+		SCW_State::set(
+			array(
+				'current_delay'    => $pace['delay'],
+				'ewma_duration_ms' => $pace['ewma'],
+				'last_request_at'  => (int) $finished_at,
+			)
+		);
+
+		return $pace;
 	}
 
 	/**
